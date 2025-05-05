@@ -1,0 +1,456 @@
+import os
+import json
+import asyncio
+from typing import Dict, Any, List, Optional, Union
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+import re
+
+class AlertIntent:
+    """Represents the LLM's understanding of the alert request"""
+    def __init__(self, alert_type: str, raw_parameters: Dict[str, Any], confidence: float):
+        self.alert_type = alert_type
+        self.raw_parameters = raw_parameters
+        self.confidence = confidence
+
+class AlertAnalysis(BaseModel):
+    """Pydantic model for LLM output"""
+    alert_type: str = Field(description="The type of alert")
+    parameters: Dict[str, Any] = Field(description="The specific parameters needed for the alert")
+    required_apis: List[str] = Field(description="List of APIs required to implement the alert")
+    description: str = Field(description="A clear description of what the alert does")
+    suggestions: List[AlertSuggestion] = Field(description="List of suggested related alerts")
+
+    class Config:
+        arbitrary_types_allowed = True
+        json_schema_extra = {
+            "example": {
+                "alert_type": "weather",
+                "parameters": {
+                    "location": "London",
+                    "condition": "below",
+                    "metric": "temperature",
+                    "targetValue": "20°C"
+                },
+                "required_apis": ["openweathermap"],
+                "description": "Alert when temperature in London drops below 20°C",
+                "suggestions": []
+            }
+        }
+
+class AgentService:
+    """
+    Main agent service that processes natural language requests and converts them
+    into structured alerts.
+    """
+    
+    def __init__(self, api_key: str = None):
+        """
+        Initialize the agent service.
+        
+        Args:
+            api_key: OpenAI API key (optional, will use env var if not provided)
+        """
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key and not USE_MOCK_LLM:
+            logger.warning("No OpenAI API key provided. Set OPENAI_API_KEY environment variable.")
+        
+        self.model = "gpt-4-turbo-preview"  # Using the latest model
+        
+        # Initialize OpenAI client
+        if not USE_MOCK_LLM:
+            try:
+                # Use the OpenAI utility for client initialization
+                self.client = create_openai_client(api_key=self.api_key)
+                if self.client:
+                    logger.info("Successfully initialized OpenAI client")
+                else:
+                    raise ValueError("Failed to create OpenAI client")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {str(e)}")
+                # Fallback to a mock client if OpenAI initialization fails
+                self.client = None
+                logger.warning("Using mock LLM client as fallback")
+        else:
+            self.client = None
+            logger.info("Using mock LLM as requested via USE_MOCK_LLM")
+    
+    async def process_natural_language_request(self, user_id: str, request: str) -> Dict[str, Any]:
+        """
+        Process a natural language request using OpenAI.
+        
+        Args:
+            user_id: User ID for context
+            request: Natural language request
+            
+        Returns:
+            Processed response with structured alert data
+        """
+        if USE_MOCK_LLM or not self.client:
+            logger.info(f"Using mock LLM for request: {request}")
+            return get_mock_response(request)
+        
+        try:
+            # Prepare the system prompt
+            system_prompt = """You are a specialized AI assistant that helps users create alerts for the BlinkAlerts app.
+            Your task is to understand the user's request and convert it into a structured alert definition.
+            You should identify the alert type, parameters, and any other relevant information.
+            Respond with a JSON object containing the alert details with the following structure:
+            {
+                "alert_type": "stock", // The type of alert (e.g., stock, weather, news, etc.)
+                "parameters": {
+                    // Specific parameters needed for this alert type
+                    "symbol": "AAPL",
+                    "condition": "above",
+                    "targetValue": 200.0,
+                    "metric": "price"
+                },
+                "required_apis": ["alphavantage"], // List of APIs required to implement the alert
+                "description": "Alert when Apple stock price goes above $200", // A clear description of what the alert does
+                "suggestions": [] // Optional list of suggested related alerts
+            }
+            """
+            
+            # Prepare the messages
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request}
+            ]
+            
+            # Call the OpenAI API using the utility
+            logger.info(f"Sending request to OpenAI: {request}")
+            response_text = generate_completion(
+                client=self.client,
+                messages=messages,
+                model=self.model,
+                temperature=0.7
+            )
+            
+            if not response_text:
+                logger.error("Failed to generate completion or received empty response")
+                return {
+                    "error": "Failed to process request",
+                    "alert_type": None,
+                    "parameters": {},
+                    "confidence": 0.0
+                }
+            
+            # Log the full response for debugging
+            logger.info(f"Raw OpenAI response: {response_text}")
+            
+            # Parse the response
+            parsed_response = self._parse_response(response_text)
+            if not parsed_response:
+                logger.error(f"Failed to parse response as JSON: {response_text[:100]}...")
+                return {
+                    "error": "Failed to parse response",
+                    "alert_type": None,
+                    "parameters": {},
+                    "confidence": 0.0
+                }
+            
+            # Log the parsed response for debugging
+            logger.info(f"Parsed response: {json.dumps(parsed_response)}")
+            
+            # Extract the alert type and parameters
+            alert_type = parsed_response.get("alert_type", "unknown")
+            parameters = parsed_response.get("parameters", {})
+            
+            # Normalize parameters based on alert type
+            normalized_parameters = self._normalize_parameters(alert_type, parameters)
+            
+            # Generate a human-readable description
+            description = parsed_response.get("description") or self._generate_description(alert_type, normalized_parameters)
+            
+            return {
+                "alert_type": alert_type,
+                "parameters": normalized_parameters,
+                "description": description,
+                "confidence": 0.9,  # High confidence for direct LLM processing
+                "suggestions": parsed_response.get("suggestions", []),
+                "required_apis": parsed_response.get("required_apis", [])
+            }
+        except Exception as e:
+            logger.error(f"Error processing natural language request: {str(e)}")
+            return {
+                "error": "Failed to process request",
+                "alert_type": None,
+                "parameters": {},
+                "confidence": 0.0
+            }
+    
+    async def analyze_alert(self, alert_type: str, alert_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze an alert using OpenAI.
+        
+        Args:
+            alert_type: Type of alert (e.g., 'weather', 'stock')
+            alert_data: Alert data
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        if USE_MOCK_LLM or not self.client:
+            logger.info(f"Using mock LLM for alert analysis: {alert_type}")
+            return {
+                "description": f"This is a mock analysis for a {alert_type} alert",
+                "suggestions": []
+            }
+        
+        try:
+            # Prepare the system prompt
+            system_prompt = """You are a specialized AI assistant that analyzes alerts for the BlinkAlerts app.
+            Your task is to analyze the given alert and provide insights and suggestions.
+            Respond with a JSON object containing the analysis details."""
+            
+            # Prepare the messages
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Please analyze this {alert_type} alert: {json.dumps(alert_data)}"}
+            ]
+            
+            # Call the OpenAI API using the utility
+            logger.info(f"Sending alert analysis request to OpenAI: {alert_type}")
+            response_text = generate_completion(
+                client=self.client,
+                messages=messages,
+                model=self.model,
+                temperature=0.7
+            )
+            
+            if not response_text:
+                logger.error("Failed to generate completion for alert analysis or received empty response")
+                return {
+                    "error": "Failed to process request",
+                    "description": f"Analysis failed for {alert_type} alert",
+                    "suggestions": []
+                }
+            
+            # Parse the response
+            parsed_response = self._parse_response(response_text)
+            if not parsed_response:
+                logger.error(f"Failed to parse alert analysis response as JSON: {response_text[:100]}...")
+                return {
+                    "error": "Failed to parse response",
+                    "description": f"Analysis failed for {alert_type} alert",
+                    "suggestions": []
+                }
+            
+            return {
+                "description": parsed_response.get("description", f"Analysis for {alert_type} alert"),
+                "suggestions": parsed_response.get("suggestions", []),
+                "insights": parsed_response.get("insights", [])
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing alert: {str(e)}")
+            return {
+                "error": "Failed to process request",
+                "description": f"Analysis failed for {alert_type} alert",
+                "suggestions": []
+            }
+    
+    def _parse_response(self, response: str) -> Dict[str, Any]:
+        """
+        Parse the response from the LLM.
+        
+        Args:
+            response: JSON response from the LLM
+            
+        Returns:
+            Parsed response as a dictionary
+        """
+        try:
+            # Check if the response is a valid JSON string
+            if not response or not response.strip():
+                logger.error("Empty response received")
+                return {}
+            
+            # Try to extract JSON from the response if it contains markdown or other text
+            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
+            if json_match:
+                json_str = json_match.group(1).strip()
+                logger.info("Extracted JSON from markdown code block")
+                # Remove comments before parsing
+                json_str = self._remove_json_comments(json_str)
+                return json.loads(json_str)
+            
+            # Try to find JSON object in the response
+            json_match = re.search(r'({[\s\S]*})', response)
+            if json_match:
+                json_str = json_match.group(1).strip()
+                logger.info("Extracted JSON from response text")
+                # Remove comments before parsing
+                json_str = self._remove_json_comments(json_str)
+                return json.loads(json_str)
+            
+            # If no JSON pattern found, try to parse the entire response
+            # Remove comments before parsing
+            response = self._remove_json_comments(response)
+            return json.loads(response)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON response: {str(e)}")
+            return {}
+    
+    def _remove_json_comments(self, json_str: str) -> str:
+        """
+        Remove comments from JSON string.
+        
+        Args:
+            json_str: JSON string with potential comments
+            
+        Returns:
+            Clean JSON string without comments
+        """
+        # Remove single-line comments (// comment)
+        json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
+        
+        # Remove multi-line comments (/* comment */)
+        json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
+        
+        logger.info("Removed comments from JSON string")
+        return json_str
+    
+    def _generate_description(self, alert_type: str, parameters: Dict[str, Any]) -> str:
+        """
+        Generate a human-readable description based on alert type.
+        
+        Args:
+            alert_type: Type of alert
+            parameters: Alert parameters
+            
+        Returns:
+            Human-readable description
+        """
+        alert_type_def = registry.get_type(alert_type)
+        if not alert_type_def:
+            return f"Unknown alert type: {alert_type}"
+            
+        # Create instance of the alert type class
+        alert_type_instance = alert_type_def.type_class()
+        
+        try:
+            # Use the alert type's description generator
+            return alert_type_instance.get_description(parameters)
+        except KeyError as e:
+            # Handle missing parameters gracefully
+            logger.warning(f"Missing parameter in description generation: {str(e)}")
+            
+            # Fallback description
+            return f"{alert_type.capitalize()} alert with parameters: {', '.join([f'{k}={v}' for k, v in parameters.items()])}"
+    
+    def _normalize_parameters(self, alert_type: str, raw_parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize parameters to ensure compatibility with client-side parsers.
+        
+        Args:
+            alert_type: Type of alert
+            raw_parameters: Raw parameters from the LLM
+            
+        Returns:
+            Normalized parameters
+        """
+        # Get the alert type definition
+        alert_type_def = registry.get_type(alert_type)
+        if not alert_type_def:
+            return raw_parameters
+        
+        # Create normalized parameters
+        normalized = {}
+        
+        # Copy parameters, applying any necessary transformations
+        for key, value in raw_parameters.items():
+            # Convert keys to camelCase if needed
+            normalized_key = key
+            
+            # Handle specific parameter transformations
+            if key == "targetValue":
+                normalized_key = "targetValue"  # Ensure consistent casing
+            elif key == "target_value":
+                normalized_key = "targetValue"
+            
+            normalized[normalized_key] = value
+        
+        return normalized
+
+# Create a singleton instance for use throughout the application
+agent_service = AgentService()
+
+async def analyze_alert_request(
+    request: Union[str, Dict[str, Any]],
+    user_history: Optional[List[Dict[str, Any]]] = None,
+    user_preferences: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Analyze a natural language alert request using context-aware processing
+    and generate related alert suggestions.
+    
+    Args:
+        request: Natural language request or pre-parsed request dictionary
+        user_history: Optional list of user's previous alerts
+        user_preferences: Optional dictionary of user preferences
+        
+    Returns:
+        Analysis result with alert type, parameters, and suggestions
+    """
+    try:
+        # Extract request text if a dictionary was provided
+        request_text = request if isinstance(request, str) else request.get("text", "")
+        user_id = request.get("user_id", "unknown") if isinstance(request, dict) else "unknown"
+        
+        # If request_text is empty but request is a string, use the string
+        if not request_text and isinstance(request, str):
+            request_text = request
+            
+        if not request_text:
+            logger.error("Empty request text")
+            return {
+                "success": False,
+                "message": "Empty request text",
+                "alert_type": None,
+                "parameters": {},
+                "required_apis": [],
+                "description": "",
+                "suggestions": []
+            }
+        
+        # Process the request
+        logger.info(f"Processing request: {request_text}")
+        result = await agent_service.process_natural_language_request(user_id, request_text)
+        
+        # Log the full result for debugging
+        logger.info(f"Process result: {json.dumps(result)}")
+        
+        # Check if the result contains an error
+        if "error" in result:
+            logger.error(f"Error processing request: {result.get('error', 'Unknown error')}")
+            return {
+                "success": False,
+                "message": result.get("error", "Failed to process request"),
+                "alert_type": None,
+                "parameters": {},
+                "required_apis": [],
+                "description": "",
+                "suggestions": []
+            }
+        
+        # Format the result for the client
+        return {
+            "success": True,
+            "message": "Alert analyzed successfully",
+            "alert_type": result.get("alert_type"),
+            "parameters": result.get("parameters", {}),
+            "required_apis": result.get("required_apis", []),
+            "description": result.get("description", ""),
+            "suggestions": result.get("suggestions", [])
+        }
+    except Exception as e:
+        logger.exception(f"Exception in analyze_alert_request: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error processing request: {str(e)}",
+            "alert_type": None,
+            "parameters": {},
+            "required_apis": [],
+            "description": "",
+            "suggestions": []
+        }
